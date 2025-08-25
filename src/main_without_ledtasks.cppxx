@@ -1,0 +1,193 @@
+/*
+  IrrigationController.cpp
+  Seeed XIAO ESP32-C6  ⟶  Zigbee Router (ZCZR)
+  - Up to 8 Zigbee "switch" endpoints (EP 11..18), each drives a GPIO relay
+  - Dead-man's switch: if ANY zone stays ON > X hours, ALL zones OFF
+  - Static endpoints (no heap) + robust serial/USB bring-up
+
+  Build: PlatformIO env "seeed_xiao_esp32c6" from platformio.ini
+*/
+
+#ifndef ZIGBEE_MODE_ZCZR
+#error "Build as Zigbee Router: add -D ZIGBEE_MODE_ZCZR and use Zigbee ZCZR partitions."
+#endif
+
+#include <Arduino.h>
+#include "Zigbee.h"  // Arduino Zigbee API (ZigbeeCore / ZigbeePowerOutlet)
+
+// ---------------- Config ----------------
+constexpr uint8_t  MAX_ZONES          = 8;
+constexpr uint8_t  FIRST_ENDPOINT     = 11;     // EPs 11..18
+constexpr bool     RELAY_ACTIVE_LOW   = false;  // set true for LOW-active relay modules
+constexpr float    DEFAULT_DEADMAN_HR = 2.0f;   // <=0 to disable safety
+constexpr bool     ZB_ERASE_NVS_ON_BOOT = false; // set true ONCE if you changed partitions
+
+// Optional debug LED (XIAO ESP32C6 user LED is typically GPIO 15).
+// Set to -1 to disable if unsure.
+constexpr int      LED_PIN            = 15;
+
+// Replace with your actual relay GPIOs:
+static const uint8_t DEFAULT_ZONE_PINS[MAX_ZONES] = { 2, 3, 4, 5, 6, 7, 8, 9 };
+
+// Pre-create static endpoints (heap-free).
+static ZigbeePowerOutlet EP_STORE[MAX_ZONES] = {
+  ZigbeePowerOutlet(FIRST_ENDPOINT + 0), ZigbeePowerOutlet(FIRST_ENDPOINT + 1),
+  ZigbeePowerOutlet(FIRST_ENDPOINT + 2), ZigbeePowerOutlet(FIRST_ENDPOINT + 3),
+  ZigbeePowerOutlet(FIRST_ENDPOINT + 4), ZigbeePowerOutlet(FIRST_ENDPOINT + 5),
+  ZigbeePowerOutlet(FIRST_ENDPOINT + 6), ZigbeePowerOutlet(FIRST_ENDPOINT + 7),
+};
+
+// ---------------- Device ----------------
+class IrrigationController {
+public:
+  IrrigationController(uint8_t num_zones,
+                       const uint8_t *pins,
+                       float deadman_hours = DEFAULT_DEADMAN_HR,
+                       const char *mfg = "DIY",
+                       const char *model = "IrrigationController")
+  : zones_(clampZones(num_zones)),
+    deadman_ms_(hoursToMs(deadman_hours)),
+    mfg_(mfg), model_(model) {
+    for (uint8_t i = 0; i < zones_; ++i) {
+      pins_[i] = pins[i];
+      last_state_[i] = false;
+      on_since_ms_[i] = 0;
+      eps_[i] = &EP_STORE[i];
+    }
+  }
+
+  void begin() {
+    // Bring up serial early and reliably for USB-CDC
+    Serial.begin(115200);
+    unsigned long start = millis();
+    while (!Serial && (millis() - start) < 2000) { /* wait up to ~2s */ }
+    Serial.println("\n[Irrigation] Booting…");
+
+    if (LED_PIN >= 0) {
+      pinMode(LED_PIN, OUTPUT);
+      digitalWrite(LED_PIN, LOW);
+      blink(2);
+    }
+
+    // GPIO init: ensure OFF on boot
+    for (uint8_t i = 0; i < zones_; ++i) {
+      pinMode(pins_[i], OUTPUT);
+      drivePin(i, /*on=*/false);
+    }
+
+    // Endpoint setup & registration
+    for (uint8_t i = 0; i < zones_; ++i) {
+      ZigbeePowerOutlet *ep = eps_[i];
+      if (!ep) continue;
+      ep->setManufacturerAndModel(mfg_, model_);
+      ep->setPowerSource(ZB_POWER_SOURCE_MAINS);
+      if (!Zigbee.addEndpoint(ep)) {
+        Serial.printf("[Irrigation] Failed to add EP %u\n", FIRST_ENDPOINT + i);
+      } else {
+        Serial.printf("[Irrigation] Added EP %u\n", FIRST_ENDPOINT + i);
+      }
+    }
+
+    // Start Zigbee stack (Router). Optionally wipe NVS once if toggled above.
+    Serial.println("[Irrigation] Starting Zigbee (router)...");
+    if (!Zigbee.begin(ZIGBEE_ROUTER, ZB_ERASE_NVS_ON_BOOT)) {
+      Serial.println("[Irrigation] Zigbee begin() failed; rebooting…");
+      delay(750);
+      ESP.restart();
+    }
+
+    Serial.print("[Irrigation] Joining");
+    uint32_t t0 = millis();
+    while (!Zigbee.connected()) {
+      Serial.print(".");
+      if (LED_PIN >= 0) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); }
+      delay(250);
+      if (millis() - t0 > 30000) { // don't block forever
+        Serial.println("\n[Irrigation] Still trying in background.");
+        break;
+      }
+    }
+    if (Zigbee.connected()) Serial.println("\n[Irrigation] Ready (joined).");
+    if (LED_PIN >= 0) digitalWrite(LED_PIN, LOW);
+  }
+
+  void loop() {
+    const uint32_t now = millis();
+    for (uint8_t i = 0; i < zones_; ++i) {
+      ZigbeePowerOutlet *ep = eps_[i];
+      if (!ep) continue;
+
+      const bool s = ep->getPowerOutletState();
+      if (s != last_state_[i]) {
+        drivePin(i, s);
+        last_state_[i] = s;
+        on_since_ms_[i] = s ? now : 0;
+        Serial.printf("[Irrigation] Zone %u -> %s\n", i + 1, s ? "ON" : "OFF");
+      }
+
+      // Dead-man safety per zone
+      if (deadman_ms_ > 0 && s && on_since_ms_[i] > 0 && (now - on_since_ms_[i]) > deadman_ms_) {
+        Serial.printf("[Irrigation] Dead-man (zone %u) triggered. ALL OFF.\n", i + 1);
+        allOff();
+        for (uint8_t z = 0; z < zones_; ++z) on_since_ms_[z] = 0;
+        break;
+      }
+    }
+
+    delay(50);
+  }
+
+  void setDeadmanHours(float hours) { deadman_ms_ = hoursToMs(hours); }
+
+  void allOff() {
+    for (uint8_t i = 0; i < zones_; ++i) {
+      ZigbeePowerOutlet *ep = eps_[i];
+      if (!ep) continue;
+      if (ep->getPowerOutletState()) { ep->setState(false); } // reflect to HA
+      if (last_state_[i]) {
+        drivePin(i, false);
+        last_state_[i] = false;
+      }
+    }
+  }
+
+private:
+  static uint8_t  clampZones(uint8_t z) { return z == 0 ? 1 : (z > MAX_ZONES ? MAX_ZONES : z); }
+  static uint32_t hoursToMs(float h) {
+    if (h <= 0.0f) return 0;
+    const double ms = (double)h * 3600000.0;
+    return (ms > 4294967295.0) ? 4294967295UL : (uint32_t)ms;
+  }
+  inline void drivePin(uint8_t idx, bool on) {
+    const bool level = RELAY_ACTIVE_LOW ? !on : on;
+    digitalWrite(pins_[idx], level ? HIGH : LOW);
+  }
+  inline void blink(uint8_t times) {
+    if (LED_PIN < 0) return;
+    for (uint8_t i = 0; i < times; ++i) {
+      digitalWrite(LED_PIN, HIGH); delay(120);
+      digitalWrite(LED_PIN, LOW);  delay(120);
+    }
+  }
+
+  uint8_t  zones_;
+  uint32_t deadman_ms_;
+  const char *mfg_;
+  const char *model_;
+
+  uint8_t  pins_[MAX_ZONES];
+  bool     last_state_[MAX_ZONES];
+  uint32_t on_since_ms_[MAX_ZONES];
+  ZigbeePowerOutlet *eps_[MAX_ZONES];
+};
+
+// ---------------- Instantiate & Arduino glue ----------------
+// Edit num_zones + pins + safety as needed.
+IrrigationController controller(
+  /*num_zones=*/4,
+  /*gpio_pins=*/DEFAULT_ZONE_PINS,
+  /*deadman_hours=*/2.0f
+);
+
+void setup() { controller.begin(); }
+void loop()  { controller.loop();  }

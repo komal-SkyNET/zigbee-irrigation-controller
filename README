@@ -1,0 +1,404 @@
+# PlatformIO Project: ESP32‑C6 Zigbee Irrigation Controller (HA via zigbee2mqtt)
+
+> Drop this whole tree into a fresh PlatformIO project. It’s split cleanly into headers/sources with a tiny `main.cpp`. Default mapping exposes 4 zones on endpoints 1..4 and drives one GPIO per zone (suitable for a relay or an LED indicator). Everything comes up **OFF** on cold boot or after power loss.
+
+---
+
+=== platformio.ini ===
+[env:esp32c6]
+platform = espressif32@^6.7.0
+board = esp32-c6-devkitc-1
+framework = arduino
+monitor_speed = 115200
+
+; Helpful logs (adjust or remove in production)
+build_flags =
+  -DARDUINO_USB_MODE=1
+  -DARDUINO_USB_CDC_ON_BOOT=1
+  -DCORE_DEBUG_LEVEL=3
+  -DLOG_LOCAL_LEVEL=ESP_LOG_INFO
+  ; App-level switch to compile Zigbee paths
+  -DZB_APP_ENABLE=1
+
+; No extra libraries required; Zigbee headers ship with the ESP32 Arduino core for ESP32-C6
+lib_deps =
+
+---
+
+=== include/HunterDriver.h ===
+#pragma once
+#include <Arduino.h>
+
+namespace hunter {
+  // Adjust to your board wiring. One GPIO per zone, active HIGH.
+  struct Pins {
+    const uint8_t *zonePins;  // length = numZones
+    uint8_t numZones;
+  };
+
+  void init(const Pins &pins);
+  void allOff();
+  void startzone(uint8_t zoneNumber /*1..N; 0 = all off*/);
+}
+
+---
+
+=== src/HunterDriver.cpp ===
+#include "HunterDriver.h"
+
+namespace hunter {
+  static Pins s_cfg{nullptr, 0};
+
+  void init(const Pins &pins) {
+    s_cfg = pins;
+    for (uint8_t i = 0; i < s_cfg.numZones; ++i) {
+      pinMode(s_cfg.zonePins[i], OUTPUT);
+      digitalWrite(s_cfg.zonePins[i], LOW); // safe OFF on boot
+    }
+  }
+
+  void allOff() {
+    for (uint8_t i = 0; i < s_cfg.numZones; ++i) {
+      digitalWrite(s_cfg.zonePins[i], LOW);
+    }
+  }
+
+  void startzone(uint8_t zoneNumber) {
+    if (zoneNumber == 0) { allOff(); return; }
+    // Single-active invariant: turn all others OFF first
+    allOff();
+    const int idx = zoneNumber - 1;
+    if (idx >= 0 && (uint8_t)idx < s_cfg.numZones) {
+      digitalWrite(s_cfg.zonePins[idx], HIGH);
+    }
+  }
+}
+
+---
+
+=== include/ZigbeeDevice.h ===
+#pragma once
+#include <Arduino.h>
+extern "C" {
+  #include "esp_log.h"
+  #include "esp_timer.h"
+  #include "nvs_flash.h"
+  #include "esp_zb_platform.h"
+  #include "esp_zigbee_core.h"
+  #include "zcl/esp_zigbee_zcl_on_off.h"
+  #include "zcl/esp_zigbee_zcl_basic.h"
+  #include "zcl/esp_zigbee_zcl_identify.h"
+}
+
+class ZigbeeDevice {
+public:
+  struct Config {
+    uint8_t numZones = 4;                       // 1..16
+    uint32_t channel_mask = ESP_ZB_PRIMARY_CHANNEL_MASK;
+    bool router = true;                          // Router by default (mains-powered)
+    uint32_t deadman_max_ms = 6UL * 60UL * 60UL * 1000UL; // 6 hours
+    gpio_num_t factory_reset_button = GPIO_NUM_NC;        // hold >10s to reset
+    bool power_on_all_off = true;                // safe state on boot/power restore
+  };
+
+  explicit ZigbeeDevice(const Config &cfg);
+  void begin();
+  void loop();
+
+  // Optional helper to force all OFF (e.g., from your app code)
+  void all_off();
+
+private:
+  Config _cfg;
+  esp_zb_attribute_list_t *_basic_cluster = nullptr;
+  esp_zb_attribute_list_t *_identify_cluster = nullptr;
+  uint32_t _run_start_ms = 0;         // 0 when no zone is ON
+  uint32_t _factory_pressed_ms = 0;
+
+  static uint8_t endpoint_for_zone(uint8_t zeroBasedIndex) { return 1 + zeroBasedIndex; }
+  bool is_valid_endpoint(uint8_t ep) const;
+  void start_bdb();
+
+  bool any_zone_on() const { return _run_start_ms != 0; }
+  void mark_run_started_if_needed() { if (_run_start_ms == 0) _run_start_ms = millis(); }
+  void mark_run_stopped() { _run_start_ms = 0; }
+
+  void set_zone(uint8_t zoneIndex, bool on);
+  bool read_onoff_attr(uint8_t endpoint) const;
+  void write_onoff_attr(uint8_t endpoint, bool on);
+  void report_onoff(uint8_t endpoint);
+  void factory_reset();
+
+  static esp_err_t zcl_handler_s(const esp_zb_zcl_cmd_t *cmd);
+  esp_err_t zcl_handler(const esp_zb_zcl_cmd_t *cmd);
+
+  // crude singleton for static callbacks
+  static ZigbeeDevice *get_instance() { return _instance; }
+  static void set_instance(ZigbeeDevice *inst) { _instance = inst; }
+  static ZigbeeDevice *_instance;
+
+  friend void setup();
+};
+
+---
+
+=== src/ZigbeeDevice.cpp ===
+#include "ZigbeeDevice.h"
+#include "HunterDriver.h"
+
+ZigbeeDevice* ZigbeeDevice::_instance = nullptr;
+
+ZigbeeDevice::ZigbeeDevice(const Config &cfg) : _cfg(cfg) {
+  if (_cfg.numZones < 1) _cfg.numZones = 1;
+  if (_cfg.numZones > 16) _cfg.numZones = 16;
+}
+
+void ZigbeeDevice::begin() {
+#if !defined(ZB_APP_ENABLE)
+#  error "Zigbee paths disabled. Ensure -DZB_APP_ENABLE=1 is in build_flags."
+#endif
+  ESP_ERROR_CHECK(nvs_flash_init());
+
+  if (_cfg.power_on_all_off) hunter::allOff();
+
+  esp_zb_platform_config_t platform_config = {
+    .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
+    .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
+  };
+  ESP_ERROR_CHECK(esp_zb_platform_config(&platform_config));
+
+  esp_zb_cfg_t zb_nwk_cfg = {};
+  zb_nwk_cfg.esp_zb_role = _cfg.router ? ESP_ZB_DEVICE_TYPE_ROUTER : ESP_ZB_DEVICE_TYPE_ED;
+  zb_nwk_cfg.install_code_policy = false;
+  zb_nwk_cfg.nwk_cfg.zczr_cfg = ESP_ZB_DEFAULT_ZR_CONFIG();
+  ESP_ERROR_CHECK(esp_zb_init(&zb_nwk_cfg));
+
+  // Create shared clusters
+  _basic_cluster = esp_zb_basic_cluster_create(NULL);
+  _identify_cluster = esp_zb_identify_cluster_create(NULL);
+
+  // Build endpoints: 1..numZones
+  for (uint8_t i = 0; i < _cfg.numZones; ++i) {
+    uint8_t ep_id = endpoint_for_zone(i);
+
+    esp_zb_on_off_cluster_cfg_t onoff_cfg = { .on_off = ESP_ZB_ZCL_ON_OFF_OFF };
+    esp_zb_attribute_list_t *onoff_cluster = esp_zb_on_off_cluster_create(&onoff_cfg);
+
+    esp_zb_ep_list_t *ep = esp_zb_ep_list_create();
+    esp_zb_cluster_list_t *cluster_list = esp_zb_cluster_list_create();
+
+    esp_zb_cluster_list_add_basic_cluster(cluster_list, _basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_identify_cluster(cluster_list, _identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_on_off_cluster(cluster_list, onoff_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_ep_list_add_ep(ep, cluster_list, ep_id, ESP_ZB_AF_HA_PROFILE_ID, ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID);
+
+    ESP_ERROR_CHECK(esp_zb_device_register(ep));
+  }
+
+  // Register endpoint handler (On/Off commands)
+  esp_zb_app_register_ep_handler(&ZigbeeDevice::zcl_handler_s);
+
+  // Start Zigbee commissioning as a Router
+  xTaskCreate([](void *arg){
+    ZigbeeDevice *self = static_cast<ZigbeeDevice*>(arg);
+    self->start_bdb();
+    vTaskDelete(NULL);
+  }, "zb_start", 4096, this, 5, NULL);
+}
+
+void ZigbeeDevice::loop() {
+  // Let Zigbee stack do its thing
+  esp_zb_app_task();
+
+  // Dead-man cutoff
+  if (any_zone_on()) {
+    const uint32_t elapsed = millis() - _run_start_ms;
+    if (elapsed > _cfg.deadman_max_ms) {
+      all_off();
+    }
+  }
+
+  // Factory reset (hold >10s)
+  if (_cfg.factory_reset_button != GPIO_NUM_NC) {
+    if (digitalRead((int)_cfg.factory_reset_button) == LOW) {
+      if (_factory_pressed_ms == 0) _factory_pressed_ms = millis();
+      if (millis() - _factory_pressed_ms > 10000) {
+        factory_reset();
+      }
+    } else {
+      _factory_pressed_ms = 0;
+    }
+  }
+}
+
+void ZigbeeDevice::all_off() {
+  hunter::allOff();
+  mark_run_stopped();
+  for (uint8_t i = 0; i < _cfg.numZones; ++i) {
+    const uint8_t ep = endpoint_for_zone(i);
+    write_onoff_attr(ep, false);
+    report_onoff(ep);
+  }
+}
+
+void ZigbeeDevice::set_zone(uint8_t zoneIndex, bool on) {
+  const uint8_t ep = endpoint_for_zone(zoneIndex);
+  if (on) {
+    hunter::startzone(zoneIndex + 1);
+    mark_run_started_if_needed();
+    // turn all other endpoints OFF in the ZCL view
+    for (uint8_t i = 0; i < _cfg.numZones; ++i) {
+      if (i == zoneIndex) continue;
+      write_onoff_attr(endpoint_for_zone(i), false);
+      report_onoff(endpoint_for_zone(i));
+    }
+  } else {
+    // stop all to keep single-active invariant
+    hunter::startzone(0);
+    mark_run_stopped();
+  }
+  write_onoff_attr(ep, on);
+  report_onoff(ep);
+}
+
+bool ZigbeeDevice::is_valid_endpoint(uint8_t ep) const {
+  const uint8_t minEp = endpoint_for_zone(0);
+  const uint8_t maxEp = endpoint_for_zone(_cfg.numZones - 1);
+  return ep >= minEp && ep <= maxEp;
+}
+
+bool ZigbeeDevice::read_onoff_attr(uint8_t endpoint) const {
+  uint8_t onoff = 0;
+  esp_zb_zcl_status_t status = esp_zb_zcl_get_attribute_val(endpoint, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+                                  &onoff);
+  if (status != ESP_ZB_ZCL_STATUS_SUCCESS) return false;
+  return onoff != 0;
+}
+
+void ZigbeeDevice::write_onoff_attr(uint8_t endpoint, bool on) {
+  uint8_t onoff = on ? 1 : 0;
+  (void)esp_zb_zcl_set_attribute_val(endpoint, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+                                     &onoff);
+}
+
+void ZigbeeDevice::report_onoff(uint8_t endpoint) {
+  esp_zb_zcl_report_attr_cmd_t report = {};
+  report.zcl_basic_cmd.src_endpoint = endpoint;
+  report.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
+  report.clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+  report.attributeID = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+  esp_zb_zcl_report_attr_cmd_req(&report);
+}
+
+void ZigbeeDevice::factory_reset() {
+  all_off();
+  esp_zb_factory_reset();
+  delay(100);
+  esp_restart();
+}
+
+esp_err_t ZigbeeDevice::zcl_handler_s(const esp_zb_zcl_cmd_t *cmd) {
+  ZigbeeDevice *self = get_instance();
+  return self ? self->zcl_handler(cmd) : ESP_OK;
+}
+
+esp_err_t ZigbeeDevice::zcl_handler(const esp_zb_zcl_cmd_t *cmd) {
+  if (!cmd) return ESP_FAIL;
+  if (cmd->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+    const uint8_t ep = cmd->addr.endpoint;
+    if (!is_valid_endpoint(ep)) return ESP_OK;
+
+    const uint8_t zoneIndex = ep - 1; // 0-based
+    bool on = false;
+    if (cmd->id == ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE) {
+      on = !read_onoff_attr(ep);
+    } else if (cmd->id == ESP_ZB_ZCL_CMD_ON_OFF_ON) {
+      on = true;
+    } else if (cmd->id == ESP_ZB_ZCL_CMD_ON_OFF_OFF) {
+      on = false;
+    } else {
+      return ESP_OK;
+    }
+    set_zone(zoneIndex, on);
+  }
+  return ESP_OK;
+}
+
+void ZigbeeDevice::start_bdb() {
+  esp_zb_set_primary_network_channel_set(_cfg.channel_mask);
+  esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+}
+
+---
+
+=== src/main.cpp ===
+#include <Arduino.h>
+#include "ZigbeeDevice.h"
+#include "HunterDriver.h"
+
+// **** CONFIGURE YOUR ZONES -> GPIO PINS HERE ****
+// For ESP32‑C6 DevKitC-1 typical usable GPIOs include: 2,3,4,5,6,7,8,9,10,11,12,13
+// Adjust to your wiring. One pin per zone; active HIGH.
+static const uint8_t ZONE_PINS[] = { 4, 5, 6, 7 }; // 4 zones by default
+
+ZigbeeDevice::Config g_cfg = {
+  .numZones = (uint8_t)(sizeof(ZONE_PINS)/sizeof(ZONE_PINS[0])),
+  .channel_mask = ESP_ZB_PRIMARY_CHANNEL_MASK,
+  .router = true,
+  .deadman_max_ms = (uint32_t)(6UL * 60UL * 60UL * 1000UL), // 6h
+  .factory_reset_button = GPIO_NUM_9,  // wire momentary button to pull LOW when pressed
+  .power_on_all_off = true,
+};
+
+ZigbeeDevice g_device(g_cfg);
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // Initialize physical driver with your pin map
+  hunter::Pins pins{ZONE_PINS, (uint8_t)(sizeof(ZONE_PINS))};
+  hunter::init(pins);
+  hunter::allOff(); // ensure safe OFF after power-up/power-loss
+
+  // Prepare Zigbee device
+  // Register singleton for static callbacks
+  {
+    extern ZigbeeDevice* ZigbeeDevice__instance_accessor();
+  }
+  // Directly set the instance for callbacks
+  // (friend access is already granted via declaration in header)
+  // NOLINTNEXTLINE (we're intentionally touching private static for bootstrap)
+  {
+    // since we can't reference private symbol here, call the friend via a lambda
+    struct Setter { static void set(ZigbeeDevice* inst){
+      // replicate static setter
+      *(ZigbeeDevice**)(&ZigbeeDevice::_instance) = inst; } };
+    Setter::set(&g_device);
+  }
+
+  g_device.begin();
+  Serial.println("ZigbeeDevice: commissioning via BDB (enable permit join in zigbee2mqtt)");
+}
+
+void loop() {
+  g_device.loop();
+}
+
+---
+
+### Build & Validate (PlatformIO)
+1) **Create project**: `pio init --board esp32-c6-devkitc-1` then paste the files above.
+2) **Select USB CDC** (already enabled via build flags). Open serial at 115200.
+3) **Build/Upload**: `pio run -t upload -t monitor`.
+4) **Pairing**: Put zigbee2mqtt in **permit join**, power the device; it appears with **N switches** (endpoints 1..N). Toggle to test; each ON turns others OFF.
+5) **Dead-man test**: Temporarily set `deadman_max_ms = 10*1000` (10s), upload, turn a zone ON, verify it turns OFF automatically.
+
+### Notes
+- All zones come up **OFF** on boot and after any watchdog/power reset.
+- `ZONE_PINS[]` is the single source of truth for zone↔GPIO mapping; set it to match your relays/LEDs.
+- If you need separate pins for *relay* vs *indicator LED*, we can extend `HunterDriver` with two pin arrays easily.
+- The device advertises as **HA On/Off Output** per endpoint for maximum HA compatibility through zigbee2mqtt.
