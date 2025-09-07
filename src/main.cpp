@@ -1,205 +1,185 @@
 #include "Zigbee.h"
 #include "HunterRoam.h"
-#include "esp_zigbee_cluster.h"   // for esp_zb_zcl_set_attribute_val & cluster IDs
 
 /********************* Configuration **************************/
 #define SMARTPORT_PIN 5
-#define BUTTON_PIN    BOOT_PIN
+#define BUTTON_PIN    BOOT_PIN // Using the default BOOT button for factory reset
 #define LED_PIN       LED_BUILTIN
+#define LED_ON        LOW      // For many boards, the built-in LED is active-low (LOW turns it on)
+#define LED_OFF       HIGH
+#define NUM_ZONES     4
+#define SAFETY_TIMEOUT_MINUTES 60 // Safety shut-off time in minutes
 
-#define NUM_ZONES 4
-
+// The ZoneConfig is simplified. Home Assistant will manage names and all timing.
+// We only need to define the Zigbee endpoint and a model name for identification.
 struct ZoneConfig {
-  const char* name;
-  uint8_t endpoint;       // Zigbee endpoint ID
-  uint8_t wateringTime;   // minutes
+    const char* modelName;
+    uint8_t endpoint;
 };
 
-// Define your zones/endpoints/durations here
 ZoneConfig zones[NUM_ZONES] = {
-  {"Front Yard", 10, 2},
-  {"Backyard",   11, 5},
-  {"Garden Bed", 12, 15},
-  {"Side Lawn",  13, 1}
+    {"Zone 1", 10},
+    {"Zone 2", 11},
+    {"Zone 3", 12},
+    {"Zone 4", 13}
 };
 
-/********************* HunterRoam **************************/
+/********************* Hardware Instances *********************/
 HunterRoam hunter(SMARTPORT_PIN);
+ZigbeeLight* valves[NUM_ZONES];
 
-/********************* Zigbee Endpoints **************************/
-ZigbeeDimmableLight* valves[NUM_ZONES];
+/********************* Core Logic *****************************/
 
-/********************* State & Timers **************************/
-static volatile bool updating[NUM_ZONES] = {false};  // guard only for app-initiated HA updates
-unsigned long valveEndTimes[NUM_ZONES]   = {0};      // millis when zone should turn off
-unsigned long valveDurations[NUM_ZONES]  = {0};      // duration (ms) of current run
+/**
+ * @brief Handles a state change request from the Zigbee coordinator (e.g., Home Assistant).
+ *
+ * This function is now stateless. It directly translates the requested state
+ * (on/off) into a hardware command for the Hunter controller. It does not
+ * track timers or current state, as Home Assistant is the source of truth.
+ *
+ * @param index The index (0-3) of the zone to control.
+ * @param requestedState The desired state: true for ON, false for OFF.
+ */
+void handleZoneChange(uint8_t index, bool requestedState) {
+    uint8_t zoneNumber = index + 1; // The HunterRoam library is 1-based
 
-/********************* Utilities **************************/
-// Write Level attribute directly (no callback fired)
-static void writeLevelAttr(uint8_t endpoint, uint8_t level /*0..255*/) {
-  esp_zb_lock_acquire(portMAX_DELAY);
-  esp_zb_zcl_set_attribute_val(
-    endpoint,
-    ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-    ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID,
-    &level,
-    false
-  );
-  esp_zb_lock_release();
+    if (requestedState) {
+        Serial.printf("Received ON request for zone %d (%s) with %d-minute safety timer\n", zoneNumber, zones[index].modelName, SAFETY_TIMEOUT_MINUTES);
+        
+        // Start the zone with the defined safety timeout. This acts as a dead man's
+        // switch in case the 'off' command from Home Assistant is never received.
+        byte err = hunter.startZone(zoneNumber, SAFETY_TIMEOUT_MINUTES);
+
+        if (err != 0) {
+            Serial.printf("ERROR starting zone %d: %s\n",
+                          zoneNumber, hunter.errorHint(err).c_str());
+            // We don't need to revert the state in Zigbee. HA will see the
+            // command failed or the state didn't change.
+        } else {
+            Serial.printf("Successfully started zone %d\n", zoneNumber);
+        }
+    } else {
+        Serial.printf("Received OFF request for zone %d (%s)\n", zoneNumber, zones[index].modelName);
+        byte err = hunter.stopZone(zoneNumber);
+
+        if (err != 0) {
+            Serial.printf("ERROR stopping zone %d: %s\n",
+                          zoneNumber, hunter.errorHint(err).c_str());
+        } else {
+            Serial.printf("Successfully stopped zone %d\n", zoneNumber);
+        }
+    }
 }
 
-// Called when HA toggles a zone (via Zigbee on/off)
-static void handleZoneChange(uint8_t index, bool requestedState) {
-  if (updating[index]) {
-    // We’re in the middle of an app-initiated cluster update; ignore to avoid loops.
-    return;
-  }
-
-  if (requestedState) {
-    // Turn ON: start zone for configured duration
-    const uint8_t minutes = zones[index].wateringTime;
-    byte err = hunter.startZone(index + 1, minutes);
-    if (err != 0) {
-      Serial.printf("Error starting zone %u (%s): %s\n",
-                    (unsigned)(index + 1), zones[index].name, hunter.errorHint(err).c_str());
-      // Reflect failure back to HA
-      updating[index] = true;
-      valves[index]->setLightState(false);
-      updating[index] = false;
-      writeLevelAttr(zones[index].endpoint, 0);
-      return;
-    }
-
-    Serial.printf("Started zone %u (%s) for %u minutes\n",
-                  (unsigned)(index + 1), zones[index].name, (unsigned)minutes);
-
-    valveDurations[index] = (unsigned long)minutes * 60UL * 1000UL;
-    valveEndTimes[index]  = millis() + valveDurations[index];
-
-    // Immediately set “remaining time %” to 100% (255)
-    writeLevelAttr(zones[index].endpoint, 255);
-  } else {
-    // Turn OFF: stop zone
-    byte err = hunter.stopZone(index + 1);
-    if (err != 0) {
-      Serial.printf("Error stopping zone %u (%s): %s\n",
-                    (unsigned)(index + 1), zones[index].name, hunter.errorHint(err).c_str());
-      // Keep HA showing ON if stop failed
-      updating[index] = true;
-      valves[index]->setLightState(true);
-      updating[index] = false;
-      writeLevelAttr(zones[index].endpoint, 255);
-      return;
-    }
-
-    Serial.printf("Stopped zone %u (%s)\n", (unsigned)(index + 1), zones[index].name);
-    valveEndTimes[index]  = 0;
-    valveDurations[index] = 0;
-    writeLevelAttr(zones[index].endpoint, 0);
-  }
-}
-
-/********************* Plain C callbacks (function pointers) **************************/
+/********************* Zigbee Callbacks ***********************/
+// This macro is an efficient way to generate a unique callback
+// function for each zone, which then calls our handler.
 #define MAKE_ZONE_CALLBACK(N) \
-  void onZone##N(bool state, uint8_t /*level*/) { handleZoneChange(N, state); }
+void onZone##N(bool state){ handleZoneChange(N, state); }
 
+// Generate onZone0, onZone1, onZone2, onZone3
 MAKE_ZONE_CALLBACK(0)
 MAKE_ZONE_CALLBACK(1)
 MAKE_ZONE_CALLBACK(2)
 MAKE_ZONE_CALLBACK(3)
 
-/********************* Setup **************************/
+/********************* Setup **********************************/
 void setup() {
-  Serial.begin(115200);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+    Serial.begin(115200);
 
-  // Create endpoints
-  for (uint8_t i = 0; i < NUM_ZONES; i++) {
-    valves[i] = new ZigbeeDimmableLight(zones[i].endpoint);
-    valves[i]->setManufacturerAndModel("SkynetIrrigation", zones[i].name);
-    Zigbee.addEndpoint(valves[i]);
-  }
+    // The initial shutdown logic is now handled in the main loop once a
+    // Zigbee connection is established. This is safer and more reliable.
+    
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LED_OFF); // Start with LED off
 
-  // Attach function-pointer callbacks (signature must be void(bool,uint8_t))
-  valves[0]->onLightChange(onZone0);
-  valves[1]->onLightChange(onZone1);
-  valves[2]->onLightChange(onZone2);
-  valves[3]->onLightChange(onZone3);
+    // Create and register Zigbee endpoints for each valve
+    for (uint8_t i = 0; i < NUM_ZONES; i++) {
+        valves[i] = new ZigbeeLight(zones[i].endpoint);
+        valves[i]->setManufacturerAndModel("SkynetIrrigation", "Controller");
+        Zigbee.addEndpoint(valves[i]);
+    }
 
-  // Start Zigbee
-  if (!Zigbee.begin()) {
-    Serial.println("Zigbee failed to start! Rebooting...");
-    ESP.restart();
-  }
-  while (!Zigbee.connected()) {
-    delay(200);
-  }
-  Serial.println("Connected to Zigbee network!");
+    // Attach the unique callback to each endpoint
+    valves[0]->onLightChange(onZone0);
+    valves[1]->onLightChange(onZone1);
+    valves[2]->onLightChange(onZone2);
+    valves[3]->onLightChange(onZone3);
 
-  // Initialize Level attribute to 0 (no remaining time) for all zones
-  for (uint8_t i = 0; i < NUM_ZONES; i++) {
-    writeLevelAttr(zones[i].endpoint, 0);
-  }
+    // Start the Zigbee stack. The LED will blink until a connection is made.
+    if (!Zigbee.begin()) {
+        Serial.println("Zigbee failed to start! Rebooting...");
+        ESP.restart();
+    }
+
+    Serial.println("Zigbee started. Waiting for connection...");
 }
 
-/********************* Loop **************************/
+/********************* Main Loop ******************************/
+// To make the LED gestures more reliable, we'll use a simple state machine.
+enum LedState { UNKNOWN, BLINKING, SOLID };
+static LedState currentLedState = UNKNOWN;
+
 void loop() {
-  const unsigned long now = millis();
-
-  // Factory reset if button held ~3s
-  static bool btnPressed = false;
-  static unsigned long btnStart = 0;
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    if (!btnPressed) { btnPressed = true; btnStart = now; }
-    else if ((now - btnStart) > 3000UL) {
-      Serial.println("Factory reset Zigbee and rebooting...");
-      delay(250);
-      Zigbee.factoryReset();
-    }
-  } else {
-    btnPressed = false;
-  }
-
-  // Update remaining-time % about once per second, and handle auto-off
-  static unsigned long nextLevelUpdate = 0;
-  const bool doLevelUpdate = (now >= nextLevelUpdate);
-  if (doLevelUpdate) nextLevelUpdate = now + 1000UL;
-
-  for (uint8_t i = 0; i < NUM_ZONES; i++) {
-    if (valveEndTimes[i] != 0) {
-      // Check auto-off
-      if ((long)(now - valveEndTimes[i]) >= 0) {
-        // Time’s up: stop hardware, update HA, zero the level
-        byte err = hunter.stopZone(i + 1);
-        if (err == 0) {
-          Serial.printf("Auto-turned off zone %u (%s)\n",
-                        (unsigned)(i + 1), zones[i].name);
-          valveEndTimes[i]  = 0;
-          valveDurations[i] = 0;
-
-          // Tell HA (guarded to avoid callback loop)
-          updating[i] = true;
-          valves[i]->setLight(false, 0);   // triggers HA OFF & callback (ignored by guard)
-          updating[i] = false;
-
-          writeLevelAttr(zones[i].endpoint, 0);
-        } else {
-          Serial.printf("Error auto-stopping zone %u (%s): %s\n",
-                        (unsigned)(i + 1), zones[i].name, hunter.errorHint(err).c_str());
+    // --- 1. Initial Shutdown on First Connect ---
+    // On the first successful connection to the Zigbee network after a reboot,
+    // we ensure all valves are set to OFF. This prevents a valve from being
+    // stuck on after a power cycle.
+    static bool initialShutdownComplete = false;
+    if (Zigbee.connected() && !initialShutdownComplete) {
+        Serial.println("First connect: Setting all zones to OFF as a safety measure.");
+        for (uint8_t i = 0; i < NUM_ZONES; i++) {
+            // This triggers the onZoneN callback, which calls handleZoneChange(i, false)
+            // to issue the actual hunter.stopZone() command.
+            valves[i]->setLight(false);
         }
-      } else if (doLevelUpdate && valveDurations[i] != 0) {
-        // Refresh remaining-time % (0..255), written directly to attribute (no callback)
-        unsigned long timeLeft = valveEndTimes[i] - now;
-        uint8_t percent = (uint8_t)((timeLeft * 255UL) / valveDurations[i]); // safe since valveDurations>0
-        if (percent > 255) percent = 255; // clamp (shouldn’t happen)
-        writeLevelAttr(zones[i].endpoint, percent);
-      }
+        initialShutdownComplete = true; // Ensure this logic only runs once.
     }
-  }
 
-  // Tiny delay to keep loop stable without starving Zigbee stack
-  delay(20);
+    // --- 2. LED Status Indicator ---
+    // This logic is non-blocking to ensure the rest of the code runs smoothly.
+    static unsigned long ledTimer = 0;
+    if (Zigbee.connected()) {
+        // We are connected. The LED should be solid ON.
+        // We only write to the pin if the state is not already SOLID to be efficient.
+        if (currentLedState != SOLID) {
+            digitalWrite(LED_PIN, LED_ON);
+            currentLedState = SOLID;
+        }
+    } else {
+        // We are not connected. The LED should blink.
+        currentLedState = BLINKING;
+        if (millis() - ledTimer > 500) { // 500ms blink interval
+            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            ledTimer = millis();
+        }
+    }
+
+    // --- 3. Factory Reset Button ---
+    // This is a non-blocking check. Using a 'while' loop here would freeze the device,
+    // stopping Zigbee communication and all other tasks until the button is released.
+    // The current approach checks the button on each pass of the main loop.
+    static unsigned long buttonPressStartTime = 0;
+    static bool isButtonBeingHeld = false;
+
+    if (digitalRead(BUTTON_PIN) == LOW) { // Button is currently pressed
+        if (!isButtonBeingHeld) {
+            // This is the first moment we see the button is pressed.
+            // We record the start time and set a flag. This block only runs once per press.
+            isButtonBeingHeld = true;
+            buttonPressStartTime = millis();
+            Serial.println("Button pressed. Hold for 5 seconds for factory reset.");
+        } else if (millis() - buttonPressStartTime > 5000) { // Check if held for 5s
+            Serial.println("Factory reset triggered. Rebooting...");
+            Zigbee.factoryReset(); // This function reboots the device.
+        }
+    } else { // Button is not pressed
+        // If the button was being held, this is the moment it's released.
+        // We reset the flag so we can detect the next press.
+        if (isButtonBeingHeld) {
+            Serial.println("Button released.");
+            isButtonBeingHeld = false;
+        }
+    }
 }
