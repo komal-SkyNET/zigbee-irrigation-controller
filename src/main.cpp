@@ -30,8 +30,12 @@ ZoneConfig zones[NUM_ZONES] = {
 HunterRoam hunter(SMARTPORT_PIN);
 ZigbeeLight* valves[NUM_ZONES];
 
+// New array to track the software safety timer for each zone.
+// Its only purpose is to sync the Zigbee state if the hardware timer shuts a valve off.
+static unsigned long zoneSafetyOffTime[NUM_ZONES] = {0};
+
 // Define the states for the LED indicator in the global scope
-enum LedState { UNKNOWN, BLINKING, SOLID };
+enum LedState { UNKNOWN, BLINKING, ZONE_ACTIVE, CONNECTED_IDLE };
 
 /********************* Core Logic *****************************/
 
@@ -50,6 +54,8 @@ void handleZoneChange(uint8_t index, bool requestedState) {
                           zoneNumber, hunter.errorHint(err).c_str());
         } else {
             Serial.printf("Successfully started zone %d\n", zoneNumber);
+            // Start the software safety timer to keep Zigbee state in sync.
+            zoneSafetyOffTime[index] = millis() + (SAFETY_TIMEOUT_MINUTES * 60 * 1000UL);
         }
     } else {
         Serial.printf("Received OFF request for zone %d (%s)\n", zoneNumber, zones[index].modelName);
@@ -60,6 +66,8 @@ void handleZoneChange(uint8_t index, bool requestedState) {
                           zoneNumber, hunter.errorHint(err).c_str());
         } else {
             Serial.printf("Successfully stopped zone %d\n", zoneNumber);
+            // Clear the software safety timer as HA has shut the zone off normally.
+            zoneSafetyOffTime[index] = 0;
         }
     }
 }
@@ -91,19 +99,50 @@ void handleInitialShutdown() {
 }
 
 /**
- * @brief Manages the status LED (blinking for disconnected, solid for connected).
+ * @brief Checks if any zone is currently running by checking the safety timer array.
+ * @return true if at least one zone is active, false otherwise.
+ */
+bool isAnyZoneActive() {
+    for (uint8_t i = 0; i < NUM_ZONES; i++) {
+        // A non-zero value means the timer is set, so the zone is running.
+        if (zoneSafetyOffTime[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Manages the status LED based on connection and zone status.
+ * - Blinking: Disconnected from Zigbee network.
+ * - Solid OFF: Connected to Zigbee, but no zones are running.
+ * - Solid ON: Connected to Zigbee and at least one zone is running.
  */
 void handleLedIndicator() {
     static LedState currentLedState = UNKNOWN;
     static unsigned long ledTimer = 0;
 
     if (Zigbee.connected()) {
-        if (currentLedState != SOLID) {
-            digitalWrite(LED_PIN, LED_ON);
-            currentLedState = SOLID;
+        if (isAnyZoneActive()) {
+            // A zone is active, LED should be solid ON
+            if (currentLedState != ZONE_ACTIVE) {
+                digitalWrite(LED_PIN, LED_ON);
+                currentLedState = ZONE_ACTIVE;
+            }
+        } else {
+            // Connected but idle, LED should be OFF
+            if (currentLedState != CONNECTED_IDLE) {
+                digitalWrite(LED_PIN, LED_OFF);
+                currentLedState = CONNECTED_IDLE;
+            }
         }
     } else {
-        currentLedState = BLINKING;
+        // Not connected, LED should blink
+        if (currentLedState != BLINKING) {
+            // Transitioning to blinking state, ensures the timer is reset.
+            currentLedState = BLINKING;
+        }
+
         if (millis() - ledTimer > 500) {
             digitalWrite(LED_PIN, !digitalRead(LED_PIN));
             ledTimer = millis();
@@ -135,6 +174,21 @@ void handleFactoryResetButton() {
     }
 }
 
+/**
+ * @brief Checks if any zone's safety timer has expired and updates Zigbee state if so.
+ */
+void handleSafetyTimeout() {
+    for (uint8_t i = 0; i < NUM_ZONES; i++) {
+        // Check if a timer is active for this zone and if its time has come.
+        // millis() >= ... is a rollover-safe way to check.
+        if (zoneSafetyOffTime[i] != 0 && millis() >= zoneSafetyOffTime[i]) {
+            Serial.printf("Safety timer expired for zone %d. Updating Zigbee state to OFF.\n", i + 1);
+            valves[i]->setLight(false); // This will trigger the callback and sync everything.
+            zoneSafetyOffTime[i] = 0; // Clear the timer to prevent this from running again.
+        }
+    }
+}
+
 /********************* Setup **********************************/
 void setup() {
     Serial.begin(115200);
@@ -146,7 +200,6 @@ void setup() {
     // Initialize the Watchdog Timer. This is a safety feature to automatically
     // reboot the device if the software freezes.
     Serial.printf("Initializing Watchdog Timer with %d second timeout.\n", WDT_TIMEOUT_SECONDS);
-    // The API for esp_task_wdt_init has changed. The timeout member is now 'timeout_ms'.
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
         .trigger_panic = true,
@@ -177,13 +230,13 @@ void setup() {
 
 /********************* Main Loop ******************************/
 void loop() {
-    // --- TEST CODE for Watchdog Timer ---
+        // --- TEST CODE for Watchdog Timer ---
     // To test the watchdog, uncomment the following line. This creates an
     // infinite loop, which will prevent esp_task_wdt_reset() from being called.
     // After WDT_TIMEOUT_SECONDS, the device should automatically reboot.
     // REMEMBER TO COMMENT THIS LINE OUT AGAIN AFTER TESTING!
     // while(true);
-
+    
     // 1. "Pet" the watchdog to show the main loop is running correctly.
     esp_task_wdt_reset();
 
@@ -196,9 +249,10 @@ void loop() {
     // 4. Check if the factory reset button is being pressed.
     handleFactoryResetButton();
 
-    // 5. Add a small delay to reduce CPU usage and power consumption.
+    // 5. Check if any safety timers have expired and sync state.
+    handleSafetyTimeout();
+
+    // 6. Add a small delay to reduce CPU usage and power consumption.
     // This allows the processor to rest instead of running a tight loop.
     delay(20);
 }
-
-
