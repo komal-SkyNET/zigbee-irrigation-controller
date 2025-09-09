@@ -10,7 +10,7 @@
 #define LED_OFF       HIGH
 #define NUM_ZONES     4
 #define SAFETY_TIMEOUT_MINUTES 60 // Safety shut-off time in minutes
-#define WDT_TIMEOUT_SECONDS 5     // Watchdog Timer: reboot if the main loop freezes for this long
+#define WDT_TIMEOUT_SECONDS 10    // Watchdog Timer: reboot if the main loop freezes for this long. Increased for stability.
 
 // The ZoneConfig is simplified. Home Assistant will manage names and all timing.
 // We only need to define the Zigbee endpoint and a model name for identification.
@@ -192,13 +192,13 @@ void handleSafetyTimeout() {
 /********************* Setup **********************************/
 void setup() {
     Serial.begin(115200);
+    delay(1000); // Add a small delay on boot for hardware to stabilize
     
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LED_OFF);
 
-    // Initialize the Watchdog Timer. This is a safety feature to automatically
-    // reboot the device if the software freezes.
+    // Initialize the Watchdog Timer.
     Serial.printf("Initializing Watchdog Timer with %d second timeout.\n", WDT_TIMEOUT_SECONDS);
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
@@ -220,23 +220,28 @@ void setup() {
     valves[2]->onLightChange(onZone2);
     valves[3]->onLightChange(onZone3);
 
+    // Temporarily remove our task from the watchdog before starting Zigbee,
+    // as Zigbee.begin() can block for a long time if the hub is not nearby.
+    Serial.println("Pausing watchdog for Zigbee initialization...");
+    esp_task_wdt_delete(NULL); // NULL means the current task
+
+    // Attempt to start Zigbee. If it fails, the library state is indeterminate,
+    // and the safest action is to reboot and try again from a clean slate.
     if (!Zigbee.begin()) {
-        Serial.println("Zigbee failed to start! Rebooting...");
+        Serial.println("Failed to start Zigbee. Rebooting to try again...");
+        delay(1000); // Brief delay to allow the serial message to send
         ESP.restart();
     }
+    
+    // Re-add our task to the watchdog now that the blocking section is finished.
+    Serial.println("Resuming watchdog monitoring.");
+    esp_task_wdt_add(NULL); // NULL means the current task
 
     Serial.println("Zigbee started. Waiting for connection...");
 }
 
 /********************* Main Loop ******************************/
 void loop() {
-        // --- TEST CODE for Watchdog Timer ---
-    // To test the watchdog, uncomment the following line. This creates an
-    // infinite loop, which will prevent esp_task_wdt_reset() from being called.
-    // After WDT_TIMEOUT_SECONDS, the device should automatically reboot.
-    // REMEMBER TO COMMENT THIS LINE OUT AGAIN AFTER TESTING!
-    // while(true);
-    
     // 1. "Pet" the watchdog to show the main loop is running correctly.
     esp_task_wdt_reset();
 
