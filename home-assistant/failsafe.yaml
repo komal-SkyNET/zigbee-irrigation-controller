@@ -1,0 +1,32 @@
+
+# =====================================================================================
+#  FAILSAFE AUTOMATION: Emergency Irrigation Shutoff
+# =====================================================================================
+alias: 'Emergency Irrigation Shutoff'
+description: 'Emergency shutoff if irrigation zones run too long (failsafe).'
+
+trigger:
+  - platform: state
+    entity_id:
+      - switch.backyard_irrigation_10
+      - switch.backyard_irrigation_11
+      - switch.backyard_irrigation_12
+    to: 'on'
+    for:
+      hours: 1  # Emergency shutoff after 2 hours
+
+action:
+  - service: switch.turn_off
+    target:
+      entity_id: "{{ trigger.entity_id }}"
+  
+  - delay:
+      seconds: 2
+  
+  - service: notify.mobile_app_pixel_7_pro
+    data:
+      title: "🚨 Emergency Irrigation Shutoff"
+      message: "{{ trigger.entity_id | replace('switch.backyard_irrigation_', 'Zone ') }} has been running for over 2 hours and was automatically shut off for safety."
+      data:
+        priority: high
+        color: red

@@ -1,0 +1,80 @@
+alias: 'Morning Irrigation Schedule'
+description: 'Runs sprinklers and drip irrigation on Mon, Thu, Sun at 9 AM, skipping if rain is likely.'
+
+trigger:
+  - platform: time
+    at: '09:00:00'
+
+condition:
+  - condition: time
+    weekday:
+      - mon
+      - thu
+      - sun
+
+action:
+  - choose:
+      # -----------------------------------------------------------------------------
+      #  IF: Rain chance is high, skip the watering.
+      # -----------------------------------------------------------------------------
+      - conditions:
+          - condition: and
+            conditions:
+              - condition: template
+                value_template: "{{ states('sensor.3_day_rain_chance_percentage') not in ['unavailable', 'unknown'] }}"
+              - condition: numeric_state
+                entity_id: sensor.3_day_rain_chance_percentage
+                above: 60
+        sequence:
+          - service: notify.mobile_app_pixel_7_pro
+            data:
+              title: "🌱 Irrigation Skipped"
+              message: "Watering was skipped this morning because the 3-day average rain chance is {{ states('sensor.cobblebank_3_day_average_rain_chance') }}%, which is above 60%."
+    
+    # -------------------------------------------------------------------------------
+    #  DEFAULT: If the above conditions are not met, run the full watering cycle.
+    # -------------------------------------------------------------------------------
+    default:
+      - service: notify.mobile_app_pixel_7_pro
+        data:
+          title: "💧 Irrigation Started"
+          message: "The morning watering cycle has begun."
+      
+      # Zone 10 - 10 minutes
+      - service: switch.turn_on
+        target:
+          entity_id: switch.backyard_irrigation_10
+      - delay:
+          minutes: 10
+      - service: switch.turn_off
+        target:
+          entity_id: switch.backyard_irrigation_10
+      
+      # Zone 11 - 30 minutes
+      - service: switch.turn_on
+        target:
+          entity_id: switch.backyard_irrigation_11
+      - delay:
+          minutes: 30
+      - service: switch.turn_off
+        target:
+          entity_id: switch.backyard_irrigation_11
+      
+      # Zone 12 - 30 minutes
+      - service: switch.turn_on
+        target:
+          entity_id: switch.backyard_irrigation_12
+      - delay:
+          minutes: 30
+      - service: switch.turn_off
+        target:
+          entity_id: switch.backyard_irrigation_12
+      
+      # Final notification
+      - service: notify.mobile_app_pixel_7_pro
+        data:
+          title: "✅ Irrigation Complete"
+          message: "All watering zones have finished successfully."
+
+# If the automation is triggered while it's already running, ignore the new trigger.
+mode: single

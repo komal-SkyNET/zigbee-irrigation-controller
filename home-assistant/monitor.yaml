@@ -1,0 +1,21 @@
+alias: 'Irrigation Stuck Switch Monitor'
+description: 'Monitors for irrigation switches stuck on and sends notifications.'
+
+trigger:
+  - platform: state
+    entity_id:
+      - switch.backyard_irrigation_10
+      - switch.backyard_irrigation_11
+      - switch.backyard_irrigation_12
+    to: 'on'
+    for:
+      minutes: 45  # Alert if any zone runs longer than 45 minutes
+
+action:
+  - service: notify.mobile_app_pixel_7_pro
+    data:
+      title: "⚠️ Irrigation Zone Running Long"
+      message: "{{ trigger.entity_id | replace('switch.backyard_irrigation_', 'Zone ') }} has been running for over 45 minutes. Please check if this is normal."
+      data:
+        priority: high
+        color: orange
