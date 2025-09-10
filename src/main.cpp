@@ -3,14 +3,14 @@
 #include "esp_task_wdt.h" // Include for the Watchdog Timer
 
 /********************* Configuration **************************/
-#define SMARTPORT_PIN 5
+#define SMARTPORT_PIN D5
 #define BUTTON_PIN    BOOT_PIN // Using the default BOOT button for factory reset
 #define LED_PIN       LED_BUILTIN
 #define LED_ON        LOW      // For many boards, the built-in LED is active-low (LOW turns it on)
 #define LED_OFF       HIGH
 #define NUM_ZONES     4
 #define SAFETY_TIMEOUT_MINUTES 60 // Safety shut-off time in minutes
-#define WDT_TIMEOUT_SECONDS 10    // Watchdog Timer: reboot if the main loop freezes for this long. Increased for stability.
+#define WDT_TIMEOUT_SECONDS 30    // Watchdog Timer: reboot if the main loop freezes for this long. Increased for stability.
 
 // The ZoneConfig is simplified. Home Assistant will manage names and all timing.
 // We only need to define the Zigbee endpoint and a model name for identification.
@@ -30,17 +30,17 @@ ZoneConfig zones[NUM_ZONES] = {
 HunterRoam hunter(SMARTPORT_PIN);
 ZigbeeLight* valves[NUM_ZONES];
 
-// New array to track the software safety timer for each zone.
+// Array to track the software safety timer for each zone.
 // Its only purpose is to sync the Zigbee state if the hardware timer shuts a valve off.
 static unsigned long zoneSafetyOffTime[NUM_ZONES] = {0};
 
-// Define the states for the LED indicator in the global scope
+// States for the LED indicator
 enum LedState { UNKNOWN, BLINKING, ZONE_ACTIVE, CONNECTED_IDLE };
 
 /********************* Core Logic *****************************/
 
 /**
- * @brief Handles a state change request from the Zigbee coordinator (e.g., Home Assistant).
+ * @brief Handles a state change request
  */
 void handleZoneChange(uint8_t index, bool requestedState) {
     uint8_t zoneNumber = index + 1; // The HunterRoam library is 1-based
@@ -66,7 +66,7 @@ void handleZoneChange(uint8_t index, bool requestedState) {
                           zoneNumber, hunter.errorHint(err).c_str());
         } else {
             Serial.printf("Successfully stopped zone %d\n", zoneNumber);
-            // Clear the software safety timer as HA has shut the zone off normally.
+            // Clear the software safety timer as HA/coordinator has shut the zone off normally.
             zoneSafetyOffTime[index] = 0;
         }
     }
@@ -184,7 +184,8 @@ void handleSafetyTimeout() {
         if (zoneSafetyOffTime[i] != 0 && millis() >= zoneSafetyOffTime[i]) {
             Serial.printf("Safety timer expired for zone %d. Updating Zigbee state to OFF.\n", i + 1);
             valves[i]->setLight(false); // This will trigger the callback and sync everything.
-            zoneSafetyOffTime[i] = 0; // Clear the timer to prevent this from running again.
+            // Do NOT clear the timer here. If the stop command fails,
+            // we want this check to run again on the next loop to re-attempt the shutdown.
         }
     }
 }
@@ -245,7 +246,7 @@ void loop() {
     // 1. "Pet" the watchdog to show the main loop is running correctly.
     esp_task_wdt_reset();
 
-    // 2. Handle initial shutdown on first connect.
+    // 2. Handle initial valve/zone shutdown on first connect.
     handleInitialShutdown();
 
     // 3. Update the status LED.
