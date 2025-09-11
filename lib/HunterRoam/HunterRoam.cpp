@@ -14,9 +14,16 @@
  * 			if there has been an error. Use HunterRoam::errorHint(byte error) to obtain
  * 			a user friendly description of the error.
  * 		3) Updated functions documentation format so that IDEs can parse them.
- * 
  * 			        ------ Eloi Codina Torras - July 2020 ------
- */
+ * -------------------------------- * --------------------------------
+ * -------------------------------- * --------------------------------
+ * This library is retained and used as is without any major modifications. 
+ * https://github.com/ecodina/hunter-wifi/blob/master/esp8266-hunter-sprinkler/lib/HunterRoam/HunterRoam.cpp
+ * Thanks to all the previous authors/works.
+ * 
+ * --- Komal-SkyNET (Komal Venkatesh Ganesan) --- Sept 2025
+ * 
+ * /
 
 #include "HunterRoam.h"
 

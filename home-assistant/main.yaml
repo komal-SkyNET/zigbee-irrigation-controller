@@ -29,7 +29,7 @@ action:
           - service: notify.mobile_app_pixel_7_pro
             data:
               title: "🌱 Irrigation Skipped"
-              message: "Watering was skipped this morning because the 3-day average rain chance is {{ states('sensor.cobblebank_3_day_average_rain_chance') }}%, which is above 60%."
+              message: "Watering was skipped this morning because the 3-day average rain chance is {{ states('sensor.3_day_rain_chance_percentage') }}%, which is above 60%."
     
     # -------------------------------------------------------------------------------
     #  DEFAULT: If the above conditions are not met, run the full watering cycle.
@@ -75,6 +75,4 @@ action:
         data:
           title: "✅ Irrigation Complete"
           message: "All watering zones have finished successfully."
-
-# If the automation is triggered while it's already running, ignore the new trigger.
 mode: single

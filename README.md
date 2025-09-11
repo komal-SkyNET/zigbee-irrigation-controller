@@ -1,7 +1,7 @@
 # ESP32 Zigbee Controller for Hunter Irrigation System [HA/Zigbee2MQTT]
 This project transforms a standard Hunter sprinkler/irrigation controller (with a REM port) into a smart, Zigbee-enabled device, allowing for seamless integration with home automation platforms like Home Assistant/Zigbee2MQTT/ZHA.
 
-It exposes each sprinkler zone as an individual Zigbee switch, enabling you to control your irrigation system using automations, dashboards, and voice assistants. The firmware is designed to be stateless, treating Home Assistant as the single source of truth for all schedules and timers.
+It exposes each sprinkler zone as an individual Zigbee switch, enabling you to control your irrigation system using automations, dashboards, and voice assistants. The firmware is designed to be mostly stateless, treating Home Assistant as the single source of truth for all schedules and timers.
 
 ## Features
 - Individual Zone Control: Exposes up to 4 sprinkler (can be easily modified to support more zones) zones as separate Zigbee endpoints.
@@ -16,22 +16,22 @@ It exposes each sprinkler zone as an individual Zigbee switch, enabling you to c
 
 - Visual Status LED: The onboard LED provides instant feedback on the device's status:
 
-- Blinking: Disconnected / Searching for network.
+    - Blinking: Disconnected / Searching for network.
 
-- Solid OFF: Connected and idle.
+    - Solid OFF: Connected and idle.
 
-- Solid ON: Connected and at least one zone is active.
+    - Solid ON: Connected and at least one zone is active.
 
 - Non-Blocking Code: The main loop is highly efficient and responsive, ensuring that Zigbee communication and other tasks are handled promptly.
 
 ## Hardware Required
-- Microcontroller: A Seeed Studio XIAO ESP32-C6.
+- Microcontroller: A Seeed Studio XIAO ESP32-C6. (or any ESP32 board with Zigbee radio. Pins must be configured accordindly for the board)
 
 - Sprinkler Controller: Any Hunter controller that includes a REM Port (e.g., Hunter X-Core, X2).
 
 - Power Supply: A standard 5V USB-C power adapter and cable (e.g., a mobile phone charger).
 
-- (Recommended) A mains-powered Zigbee Router (like a smart plug) placed between your hub and the controller to ensure a strong mesh network signal. ESP32C6 signal struggled when they were crammed into the hunter controller box.
+- Optional: For a stronger signal - any mains-powered Zigbee Router (like a smart plug) placed between your hub and the controller to ensure a strong mesh network signal. ESP32C6 signal struggled when they were crammed into the hunter controller box.
 
 ## Software Required
 - Any home Automation platform: ex - Home Assistant with a Zigbee Coordinator (using Zigbee2MQTT/ZHA/etc).
@@ -43,6 +43,8 @@ It exposes each sprinkler zone as an individual Zigbee switch, enabling you to c
 ## Wiring Instructions
 The wiring for this project is simple but requires one critical connection: which is using a floating power supply and using one leg of 24VAC as ground. This is because the REM port is 5VDC logic signal with respect to the 24VAC (AC2) pin. 
 
+<img src="images/real_wiring.jpg" alt="drawing" width="300"/>
+
 ```mermaid
 graph TD
     subgraph Floating power supply DC
@@ -52,21 +54,22 @@ graph TD
     subgraph "XIAO ESP32-C6"
         B[USB-C Port]
         C(Pin D5)
-        D(Pin GND)
     end
-
+    J((connect))
     subgraph "Hunter Controller"
         E[REM Terminal]
         F[AC2-24VAC Terminal]
     end
 
+    A -- RED wire --> J
     A -- BLACK wire --> B
-    C -- Signal Wire --> E
-    A -- RED wire --> F --> B
+    C -- Signal Wire (red) --> E
+    F -- GREEN Wire --> J
+    J --> B
 ```
 
 ## Setup and Installation
-- Configure the Code: Open main.cpp and adjust any configuration constants at the top of the file if needed (e.g., NUM_ZONES). The default pin (D5) is for the XIAO ESP32-C6.
+- Configure the Code: Open main.cpp and adjust any configuration constants at the top of the file if needed (e.g., NUM_ZONES). The default signal pin (D5) is for the XIAO ESP32-C6.
 
 - Compile and Upload: Using PlatformIO or the Arduino IDE, compile and upload the firmware to your ESP32. This project used board: XIAO ESP32-C6.
 
@@ -78,9 +81,14 @@ graph TD
 
     - Power on the ESP32. The onboard LED should start blinking.
 
-    - Home Assistant should discover the device and its 4 zones. Serial console logs should look healthy. The device would log switch changes in HA.
+    - Home Assistant should discover the device and its 4 zones. Serial console logs should look healthy. The device would log switch changes from HA.
 
 - Final Installation: Once paired & verified, disconnect the ESP32, wire it to the Hunter controller's REM port as per the diagram, and power it back on.
+
+### Home assistant screenshots
+
+<img src="images/automation.png" alt="drawing" width="300"/>
+<img src="images/ha.png" alt="drawing" width="300"/>
 
 ## Acknowledgements
 This project would not be possible without the HunterRoam C++ library which handles the low-level communication with the hunter sprinkler controller.
@@ -88,7 +96,7 @@ This project would not be possible without the HunterRoam C++ library which hand
 Shout out to the works of [Sebastien](https://github.com/seb821/OpenSprinkler-Firmware-Hunter), [Ecodina](https://github.com/ecodina/hunter-wifi), Dave Fleck, and Scott Shumate and others. 
 
 ## License
-Given that [Sebastien](https://github.com/seb821/OpenSprinkler-Firmware-Hunter)/[Eloi Codina](https://github.com/ecodina/hunter-wifi) published his code under the GNU GPL v3, this project follows the same license.
+Given that both [Sebastien](https://github.com/seb821/OpenSprinkler-Firmware-Hunter)/[Eloi Codina](https://github.com/ecodina/hunter-wifi) published their code under the GNU GPL v3, this project follows the same license.
 ```
 Zigbee Irrigation Controller
 Copyright (C) 2025 Komal-SkyNET (Komal Venkatesh Ganesan)
