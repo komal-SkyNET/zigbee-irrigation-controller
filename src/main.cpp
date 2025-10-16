@@ -8,23 +8,29 @@
 #define LED_PIN       LED_BUILTIN
 #define LED_ON        LOW      // For many boards, the built-in LED is active-low (LOW turns it on)
 #define LED_OFF       HIGH
-#define NUM_ZONES     4
-#define SAFETY_TIMEOUT_MINUTES 60 // Safety shut-off time in minutes
-#define WDT_TIMEOUT_SECONDS 30    // Watchdog Timer: reboot if the main loop freezes for this long. Increased for stability.
+#define NUM_ZONES     8                // Number of irrigation zones (accepts 1-48 zones). 
+#define SAFETY_TIMEOUT_MINUTES 60      // Safety shut-off time in minutes
+#define WDT_TIMEOUT_SECONDS 30         // Watchdog Timer: reboot if the main loop freezes for this long. Increased for stability.
 
-// The ZoneConfig is simplified. Home Assistant will manage names and all timing.
-// We only need to define the Zigbee endpoint and a model name for identification.
-struct ZoneConfig {
-    const char* modelName;
-    uint8_t endpoint;
-};
+#if NUM_ZONES < 1
+    #error "NUM_ZONES must be at least 1"
+#endif
+#if NUM_ZONES > 48
+    #error "NUM_ZONES cannot exceed 48 (Hunter controller limit)"
+#endif
+/***********************************************/
 
-ZoneConfig zones[NUM_ZONES] = {
-    {"Zone 1", 10},
-    {"Zone 2", 11},
-    {"Zone 3", 12},
-    {"Zone 4", 13}
-};
+// Helper function to generate zone name dynamically
+String getZoneName(uint8_t index) {
+    return "Zone " + String(index + 1);
+}
+
+// Helper function to get Zigbee endpoint for a zone
+// Note: Endpoint IDs start at 10 (not to be confused with zone numbers which start at 1)
+// Zone 1 = zigbeeEndpoint 10, Zone 2 = zigbeeEndpoint 11, etc.
+uint8_t getZoneEndpoint(uint8_t index) {
+    return 10 + index;  // index is 0-based, so Zone 1 (index 0) gets endpoint 10
+}
 
 /********************* Hardware Instances *********************/
 HunterRoam hunter(SMARTPORT_PIN);
@@ -46,7 +52,7 @@ void handleZoneChange(uint8_t index, bool requestedState) {
     uint8_t zoneNumber = index + 1; // The HunterRoam library is 1-based
 
     if (requestedState) {
-        Serial.printf("Received ON request for zone %d (%s) with %d-minute safety timer\n", zoneNumber, zones[index].modelName, SAFETY_TIMEOUT_MINUTES);
+        Serial.printf("Received ON request for zone %d (%s) with %d-minute safety timer\n", zoneNumber, getZoneName(index).c_str(), SAFETY_TIMEOUT_MINUTES);
         byte err = hunter.startZone(zoneNumber, SAFETY_TIMEOUT_MINUTES);
 
         if (err != 0) {
@@ -58,7 +64,7 @@ void handleZoneChange(uint8_t index, bool requestedState) {
             zoneSafetyOffTime[index] = millis() + (SAFETY_TIMEOUT_MINUTES * 60 * 1000UL);
         }
     } else {
-        Serial.printf("Received OFF request for zone %d (%s)\n", zoneNumber, zones[index].modelName);
+        Serial.printf("Received OFF request for zone %d (%s)\n", zoneNumber, getZoneName(index).c_str());
         byte err = hunter.stopZone(zoneNumber);
 
         if (err != 0) {
@@ -76,11 +82,66 @@ void handleZoneChange(uint8_t index, bool requestedState) {
 #define MAKE_ZONE_CALLBACK(N) \
 void onZone##N(bool state){ handleZoneChange(N, state); }
 
-// Generate onZone0, onZone1, onZone2, onZone3
+// Generate callbacks for all 48 possible zones (Hunter controller limit)
+// Only NUM_ZONES callbacks will be used and attached in setup()
 MAKE_ZONE_CALLBACK(0)
 MAKE_ZONE_CALLBACK(1)
 MAKE_ZONE_CALLBACK(2)
 MAKE_ZONE_CALLBACK(3)
+MAKE_ZONE_CALLBACK(4)
+MAKE_ZONE_CALLBACK(5)
+MAKE_ZONE_CALLBACK(6)
+MAKE_ZONE_CALLBACK(7)
+MAKE_ZONE_CALLBACK(8)
+MAKE_ZONE_CALLBACK(9)
+MAKE_ZONE_CALLBACK(10)
+MAKE_ZONE_CALLBACK(11)
+MAKE_ZONE_CALLBACK(12)
+MAKE_ZONE_CALLBACK(13)
+MAKE_ZONE_CALLBACK(14)
+MAKE_ZONE_CALLBACK(15)
+MAKE_ZONE_CALLBACK(16)
+MAKE_ZONE_CALLBACK(17)
+MAKE_ZONE_CALLBACK(18)
+MAKE_ZONE_CALLBACK(19)
+MAKE_ZONE_CALLBACK(20)
+MAKE_ZONE_CALLBACK(21)
+MAKE_ZONE_CALLBACK(22)
+MAKE_ZONE_CALLBACK(23)
+MAKE_ZONE_CALLBACK(24)
+MAKE_ZONE_CALLBACK(25)
+MAKE_ZONE_CALLBACK(26)
+MAKE_ZONE_CALLBACK(27)
+MAKE_ZONE_CALLBACK(28)
+MAKE_ZONE_CALLBACK(29)
+MAKE_ZONE_CALLBACK(30)
+MAKE_ZONE_CALLBACK(31)
+MAKE_ZONE_CALLBACK(32)
+MAKE_ZONE_CALLBACK(33)
+MAKE_ZONE_CALLBACK(34)
+MAKE_ZONE_CALLBACK(35)
+MAKE_ZONE_CALLBACK(36)
+MAKE_ZONE_CALLBACK(37)
+MAKE_ZONE_CALLBACK(38)
+MAKE_ZONE_CALLBACK(39)
+MAKE_ZONE_CALLBACK(40)
+MAKE_ZONE_CALLBACK(41)
+MAKE_ZONE_CALLBACK(42)
+MAKE_ZONE_CALLBACK(43)
+MAKE_ZONE_CALLBACK(44)
+MAKE_ZONE_CALLBACK(45)
+MAKE_ZONE_CALLBACK(46)
+MAKE_ZONE_CALLBACK(47)
+
+// Array of function pointers for dynamic callback attachment
+void (*zoneCallbacks[48])(bool) = {
+    onZone0, onZone1, onZone2, onZone3, onZone4, onZone5, onZone6, onZone7,
+    onZone8, onZone9, onZone10, onZone11, onZone12, onZone13, onZone14, onZone15,
+    onZone16, onZone17, onZone18, onZone19, onZone20, onZone21, onZone22, onZone23,
+    onZone24, onZone25, onZone26, onZone27, onZone28, onZone29, onZone30, onZone31,
+    onZone32, onZone33, onZone34, onZone35, onZone36, onZone37, onZone38, onZone39,
+    onZone40, onZone41, onZone42, onZone43, onZone44, onZone45, onZone46, onZone47
+};
 
 /********************* Helper Functions for Main Loop *********/
 
@@ -210,16 +271,15 @@ void setup() {
 
     // Create and register Zigbee endpoints for each valve
     for (uint8_t i = 0; i < NUM_ZONES; i++) {
-        valves[i] = new ZigbeeLight(zones[i].endpoint);
+        valves[i] = new ZigbeeLight(getZoneEndpoint(i));
         valves[i]->setManufacturerAndModel("SkynetIrrigation", "Controller");
         Zigbee.addEndpoint(valves[i]);
     }
 
-    // Attach callbacks
-    valves[0]->onLightChange(onZone0);
-    valves[1]->onLightChange(onZone1);
-    valves[2]->onLightChange(onZone2);
-    valves[3]->onLightChange(onZone3);
+    // Attach callbacks dynamically based on NUM_ZONES
+    for (uint8_t i = 0; i < NUM_ZONES; i++) {
+        valves[i]->onLightChange(zoneCallbacks[i]);
+    }
 
     // Temporarily remove our task from the watchdog before starting Zigbee,
     // as Zigbee.begin() can block for a long time if the hub is not nearby.
