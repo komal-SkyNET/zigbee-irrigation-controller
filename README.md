@@ -4,7 +4,7 @@ This project transforms a standard Hunter sprinkler/irrigation controller (with 
 It exposes each sprinkler zone as an individual Zigbee switch, enabling you to control your irrigation system using automations, dashboards, and voice assistants. The firmware is designed to be mostly stateless, treating Home Assistant as the single source of truth for all schedules and timers.
 
 ## Features
-- Individual Zone Control: Exposes up to 4 sprinkler (can be easily modified to support more zones) zones as separate Zigbee endpoints.
+- Individual Zone Control: Exposes up to 8 sprinkler zones (configurable from 1-48) as separate Zigbee endpoints.
 
 - Stateless Operation: Designed to be controlled by Home Assistant automations; the device itself holds no schedules.
 
@@ -69,9 +69,12 @@ graph TD
 ```
 
 ## Setup and Installation
-- Configure the Code: Open main.cpp and adjust any configuration constants at the top of the file if needed (e.g., NUM_ZONES). The default signal pin (D5) is for the XIAO ESP32-C6.
+- Configure the Code: Open main.cpp and adjust any configuration constants at the top of the file if needed. The firmware is configured for 8 zones by default. To change the number of zones, modify NUM_ZONES (supports 1-48 zones). The default signal pin (D5) is for the XIAO ESP32-C6.
 
-- Compile and Upload: Using PlatformIO or the Arduino IDE, compile and upload the firmware to your ESP32. This project used board: XIAO ESP32-C6.
+- Compile and Upload: Using PlatformIO, you can choose between two build environments:
+    - **End Device (`..._ed`)**: Default mode. Best for standard operation.
+    - **Router (`..._router`)**: Keeps the radio always active. Use this if you want the controller to act as a mesh repeater to extend your Zigbee network.
+  Compile and upload your preferred firmware to your ESP32.
 
 - Pairing:
 
@@ -81,7 +84,7 @@ graph TD
 
     - Power on the ESP32. The onboard LED should start blinking.
 
-    - Home Assistant should discover the device and its 4 zones. Serial console logs should look healthy. The device would log switch changes from HA.
+    - Home Assistant should discover the device and its 8 zones. Serial console logs should look healthy. The device would log switch changes from HA.
 
 - Final Installation: Once paired & verified, disconnect the ESP32, wire it to the Hunter controller's REM port as per the diagram, and power it back on.
 
