@@ -71,7 +71,10 @@ graph TD
 ## Setup and Installation
 - Configure the Code: Open main.cpp and adjust any configuration constants at the top of the file if needed. The firmware is configured for 8 zones by default. To change the number of zones, modify NUM_ZONES (supports 1-48 zones). The default signal pin (D5) is for the XIAO ESP32-C6.
 
-- Compile and Upload: Using PlatformIO or the Arduino IDE, compile and upload the firmware to your ESP32. This project used board: XIAO ESP32-C6.
+- Compile and Upload: Using PlatformIO, you can choose between two build environments:
+    - **End Device (`..._ed`)**: Default mode. Best for standard operation.
+    - **Router (`..._router`)**: Keeps the radio always active. Use this if you want the controller to act as a mesh repeater to extend your Zigbee network.
+  Compile and upload your preferred firmware to your ESP32.
 
 - Pairing:
 
